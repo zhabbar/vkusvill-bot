@@ -7,7 +7,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
 from config import create_mcp_server, create_agent
-from agents import Runner, RunConfig
+from agents import Runner
+from agents.exceptions import MaxTurnsExceeded
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -47,12 +48,20 @@ async def handle_message(message: types.Message):
         result = await Runner.run(
             agent,
             input=message.text,
-            run_config=RunConfig(max_turns=20),
+            max_turns=20,
         )
         if result.final_output:
-            await message.answer(result.final_output, disable_web_page_preview=False)
+            await message.answer(
+                result.final_output,
+                disable_web_page_preview=False,
+            )
         else:
             await message.answer("Готово, но не могу сформулировать ответ.")
+    except MaxTurnsExceeded:
+        await message.answer(
+            "Не получилось собрать ответ за разумное время. "
+            "Попробуйте уточнить запрос — например, назовите конкретное блюдо."
+        )
     except Exception as e:
         await message.answer(f"Произошла ошибка: {e}")
         print(f"Ошибка: {e}")
