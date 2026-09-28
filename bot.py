@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
 from config import create_mcp_server, create_agent
-from agents import Runner
+from agents import Runner, RunConfig
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -44,7 +44,11 @@ async def handle_message(message: types.Message):
 
     await message.answer("Думаю… Это может занять до минуты.")
     try:
-        result = await Runner.run(agent, input=message.text)
+        result = await Runner.run(
+            agent,
+            input=message.text,
+            run_config=RunConfig(max_turns=20),
+        )
         if result.final_output:
             await message.answer(result.final_output, disable_web_page_preview=False)
         else:
