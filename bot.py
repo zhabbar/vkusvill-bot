@@ -51,10 +51,19 @@ async def handle_message(message: types.Message):
             max_turns=20,
         )
         if result.final_output:
-            await message.answer(
-                result.final_output,
-                disable_web_page_preview=False,
-            )
+            try:
+                await message.answer(
+                    result.final_output,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False,
+                )
+            except Exception as send_error:
+                # Если HTML сломан — отправляем как обычный текст
+                print(f"HTML parse failed, sending as plain text: {send_error}")
+                await message.answer(
+                    result.final_output,
+                    disable_web_page_preview=False,
+                )
         else:
             await message.answer("Готово, но не могу сформулировать ответ.")
     except MaxTurnsExceeded:
