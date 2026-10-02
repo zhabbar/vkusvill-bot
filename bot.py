@@ -2,6 +2,7 @@ import os
 os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 
 import asyncio
+import ast
 import json
 import re
 import time
@@ -65,43 +66,60 @@ def describe_args(tool_name: str, args: dict) -> str:
     return ""
 
 
-def _extract_text_payload(raw_output: str) -> str:
+def _get_text_from_mcp_output(output) -> str:
     """
-    Достаёт полезную нагрузку из MCP-обёртки вида:
-    {'type': 'text', 'text': '{\n  "ok": true, ...}'}
-    Возвращает строку — то, что можно распарсить как JSON.
+    Извлекает текст из ответа MCP-инструмента.
+    MCP возвращает объект ToolCallResult с полем .content (список TextContent).
     """
-    raw = raw_output.strip()
+    # Случай 1: объект с .content (список элементов с .text)
+    if hasattr(output, "content"):
+        content = output.content
+        if isinstance(content, list):
+            texts = []
+            for c in content:
+                if hasattr(c, "text"):
+                    texts.append(c.text)
+                elif isinstance(c, dict) and "text" in c:
+                    texts.append(c["text"])
+            if texts:
+                return "\n".join(texts)
 
-    # Случай 1: питоновский dict со str-представлением
-    if raw.startswith("{'type'") or raw.startswith('{"type"'):
-        # Вытаскиваем содержимое поля 'text' регуляркой
-        m = re.search(
-            r"['\"]text['\"]\s*:\s*['\"]((?:[^'\"\\]|\\.)*)['\"]",
-            raw,
-            re.DOTALL,
-        )
-        if m:
-            extracted = m.group(1)
-            try:
-                # Раскодируем escape-последовательности (\n, \", \\ и т.д.)
-                extracted = bytes(extracted, "utf-8").decode("unicode_escape")
-            except Exception:
-                pass
-            return extracted
+    # Случай 2: список (list) элементов
+    if isinstance(output, list):
+        texts = []
+        for c in output:
+            if hasattr(c, "text"):
+                texts.append(c.text)
+            elif isinstance(c, dict) and "text" in c:
+                texts.append(c["text"])
+        if texts:
+            return "\n".join(texts)
 
-    # Случай 2: уже чистый JSON или что-то другое
-    return raw
+    # Случай 3: строка — возможно, это питоновский dict repr
+    raw_str = str(output)
+    try:
+        d = ast.literal_eval(raw_str)
+        if isinstance(d, dict):
+            if "text" in d:
+                return str(d["text"])
+            if "content" in d and isinstance(d["content"], list) and d["content"]:
+                c0 = d["content"][0]
+                if isinstance(c0, dict) and "text" in c0:
+                    return str(c0["text"])
+    except (ValueError, SyntaxError):
+        pass
+
+    return raw_str
 
 
-def format_tool_output(tool_name: str, raw_output: str) -> str:
-    """Превращает сырой ответ MCP в читаемую строку."""
-    payload_str = _extract_text_payload(raw_output)
+def format_tool_output(tool_name: str, output) -> str:
+    """Превращает ответ MCP в читаемую строку."""
+    payload_str = _get_text_from_mcp_output(output)
 
     try:
         data = json.loads(payload_str)
     except json.JSONDecodeError:
-        preview = payload_str[:400].replace("<", "&lt;").replace(">", "&gt;")
+        preview = payload_str[:200].replace("<", "&lt;").replace(">", "&gt;")
         return f"<code>{preview}</code>"
 
     # --- Поиск товаров ---
@@ -110,7 +128,6 @@ def format_tool_output(tool_name: str, raw_output: str) -> str:
         meta = data.get("data", {}).get("meta", {})
         if not items:
             return "❌ Ничего не найдено"
-
         lines = [f"Найдено {meta.get('total', '?')} товаров. Первые:"]
         for item in items[:3]:
             name = item.get("name", "?")
@@ -128,33 +145,41 @@ def format_tool_output(tool_name: str, raw_output: str) -> str:
             return "❌ Рецепты не найдены"
         first = recipes[0]
         name = first.get("name", "?")
-        lines = [f"📖 {name}"]
-        ingredients = first.get("ingredients", []) or first.get("properties", [])
-        if ingredients:
-            ings = []
-            for ing in ingredients[:6]:
-                if isinstance(ing, dict):
-                    ings.append(ing.get("name", "?"))
-                else:
-                    ings.append(str(ing))
-            lines.append(f"  Ингредиенты: {', '.join(ings)}…")
-        return "\n".join(lines)
+        return f"📖 {name}"
 
-    # --- Создание корзины ---
+    # --- Корзина ---
     if tool_name == "vkusvill_cart_link_create":
         link = data.get("data", {}).get("link", "")
-        return f"🔗 Корзина создана: <a href=\"{link}\">открыть</a>"
+        return f'🔗 Корзина создана: <a href="{link}">открыть</a>'
 
     # --- Детали товара ---
     if tool_name == "vkusvill_product_details":
         item = data.get("data", {})
-        name = item.get("name", "?")
         price = item.get("price", {}).get("current", "?")
-        return f"📋 {name} — {price} ₽"
+        return f"📋 {item.get('name', '?')} — {price} ₽"
 
     # --- Fallback ---
-    preview = payload_str[:300].replace("<", "&lt;").replace(">", "&gt;")
+    preview = payload_str[:200].replace("<", "&lt;").replace(">", "&gt;")
     return f"<code>{preview}</code>"
+
+
+def clean_broken_html(text: str) -> str:
+    """
+    Убирает сломанные HTML-теги, но сохраняет URL как текст.
+    Используется, если модель сгенерировала невалидный HTML.
+    """
+    # Сначала заменяем <a href="URL">текст</a> на "текст (URL)"
+    clean = re.sub(
+        r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>',
+        r"\2 (\1)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Удаляем остальные теги
+    clean = re.sub(r"<[^>]+>", "", clean)
+    # Раскодируем HTML-энтити
+    clean = clean.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return clean
 
 
 def truncate(text: str, limit: int = 1500) -> str:
@@ -256,7 +281,8 @@ async def handle_message(message: types.Message):
                     await message.answer(text, parse_mode="HTML")
 
                 elif item_type == "tool_call_output_item":
-                    raw_output = str(getattr(event.item, "output", ""))
+                    # Передаём сам объект, а не str()
+                    raw_output = getattr(event.item, "output", "")
                     formatted = format_tool_output(last_tool_name or "", raw_output)
                     await message.answer(
                         f"📥 <b>Ответ:</b>\n{formatted}",
@@ -280,9 +306,11 @@ async def handle_message(message: types.Message):
                     disable_web_page_preview=False,
                 )
             except Exception as send_error:
-                print(f"HTML parse failed, sending as plain text: {send_error}")
+                print(f"HTML parse failed, cleaning: {send_error}")
+                # Очищаем от сломанных тегов и отправляем как plain text
+                clean = clean_broken_html(truncate(final_output))
                 await message.answer(
-                    truncate(final_output),
+                    clean,
                     disable_web_page_preview=False,
                 )
         else:
