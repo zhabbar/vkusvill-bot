@@ -64,6 +64,70 @@ def describe_args(tool_name: str, args: dict) -> str:
     return ""
 
 
+def format_tool_output(tool_name: str, raw_output: str) -> str:
+    """
+    Превращает сырой JSON от MCP в читаемую строку.
+    """
+    try:
+        data = json.loads(raw_output)
+    except json.JSONDecodeError:
+        # Не JSON — просто обрезаем
+        return f"<code>{raw_output[:400]}</code>"
+
+    # --- Поиск товаров ---
+    if tool_name == "vkusvill_products_search":
+        items = data.get("data", {}).get("items", [])
+        meta = data.get("data", {}).get("meta", {})
+        if not items:
+            return "❌ Ничего не найдено"
+
+        lines = [f"Найдено {meta.get('total', '?')} товаров. Первые:"]
+        for item in items[:3]:
+            name = item.get("name", "?")
+            price = item.get("price", {}).get("current", "?")
+            unit = item.get("unit", "шт")
+            weight = item.get("weight", "")
+            # Обрезаем длинное название
+            if len(name) > 50:
+                name = name[:50] + "…"
+            weight_str = f", {weight}" if weight else ""
+            lines.append(f"  • {name} — {price} ₽/{unit}{weight_str}")
+        return "\n".join(lines)
+
+    # --- Рецепты ---
+    if tool_name == "vkusvill_recipes":
+        recipes = data.get("data", {}).get("items", [])
+        if not recipes:
+            return "❌ Рецепты не найдены"
+        first = recipes[0]
+        name = first.get("name", "?")
+        ingredients = first.get("ingredients", [])
+        lines = [f"📖 {name}"]
+        if ingredients:
+            ings = ", ".join(
+                (ing.get("name", "?") if isinstance(ing, dict) else str(ing))
+                for ing in ingredients[:5]
+            )
+            lines.append(f"  Ингредиенты: {ings}…")
+        return "\n".join(lines)
+
+    # --- Создание корзины ---
+    if tool_name == "vkusvill_cart_link_create":
+        link = data.get("data", {}).get("link", "")
+        return f"🔗 Корзина создана: <a href=\"{link}\">открыть</a>"
+
+    # --- Детали товара ---
+    if tool_name == "vkusvill_product_details":
+        item = data.get("data", {})
+        name = item.get("name", "?")
+        price = item.get("price", {}).get("current", "?")
+        return f"📋 {name} — {price} ₽"
+
+    # --- Fallback ---
+    preview = raw_output[:300].replace("<", "&lt;").replace(">", "&gt;")
+    return f"<code>{preview}</code>"
+
+
 def truncate(text: str, limit: int = 1500) -> str:
     if len(text) <= limit:
         return text
@@ -135,6 +199,9 @@ async def handle_message(message: types.Message):
 
         tools_used = {}
         step = 0
+        # Запоминаем имя последнего вызванного инструмента,
+        # чтобы правильно отформатировать его output
+        last_tool_name = None
 
         async for event in result.stream_events():
             if isinstance(event, RunItemStreamEvent):
@@ -143,6 +210,7 @@ async def handle_message(message: types.Message):
                 if item_type == "tool_call_item":
                     step += 1
                     tool_name = getattr(event.item.raw_item, "name", "инструмент")
+                    last_tool_name = tool_name
                     tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
 
                     args_display = ""
@@ -161,23 +229,13 @@ async def handle_message(message: types.Message):
                     await message.answer(text, parse_mode="HTML")
 
                 elif item_type == "tool_call_output_item":
-                    output = getattr(event.item, "output", "")
-                    output_str = str(output)
-                    preview = output_str[:300].replace("<", "&lt;").replace(">", "&gt;")
+                    raw_output = str(getattr(event.item, "output", ""))
+                    formatted = format_tool_output(last_tool_name or "", raw_output)
                     await message.answer(
-                        f"📥 <b>Ответ инструмента</b>\n<code>{preview}</code>",
+                        f"📥 <b>Ответ:</b>\n{formatted}",
                         parse_mode="HTML",
+                        disable_web_page_preview=True,
                     )
-
-                elif item_type == "message_output_item":
-                    content = getattr(event.item, "content", "")
-                    content_str = str(content).strip()
-                    if content_str:
-                        preview = content_str[:500].replace("<", "&lt;").replace(">", "&gt;")
-                        await message.answer(
-                            f"💬 <b>Модель говорит:</b>\n<pre>{preview}</pre>",
-                            parse_mode="HTML",
-                        )
 
         elapsed = int(time.time() - start_time)
         final_output = result.final_output
