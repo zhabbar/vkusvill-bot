@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-from config import create_mcp_server, create_agent, MODEL_NAME
+from config import create_mcp_server, create_agent, MODEL_NAME, MAX_TURNS
 from agents import Runner
 from agents.exceptions import MaxTurnsExceeded
 from agents.stream_events import RunItemStreamEvent
@@ -65,7 +65,6 @@ def describe_args(tool_name: str, args: dict) -> str:
 
 
 def truncate(text: str, limit: int = 1500) -> str:
-    """Обрезает длинный текст до лимита Telegram."""
     if len(text) <= limit:
         return text
     return text[:limit] + "\n…<обрезано>"
@@ -83,7 +82,7 @@ async def init_agent():
     mcp_server = await create_mcp_server()
     await mcp_server.__aenter__()
     agent = await create_agent(mcp_server)
-    print(f"✅ Агент инициализирован. Модель: {MODEL_NAME}")
+    print(f"✅ Агент инициализирован. Модель: {MODEL_NAME}. MAX_TURNS: {MAX_TURNS}")
 
 
 @dp.message(Command("start"))
@@ -123,7 +122,7 @@ async def handle_message(message: types.Message):
     start_time = time.time()
 
     await message.answer(
-        f"🤔 Начинаю работу…\n<i>Модель: {short_model}</i>",
+        f"🤔 Начинаю работу…\n<i>Модель: {short_model}, лимит шагов: {MAX_TURNS}</i>",
         parse_mode="HTML",
     )
 
@@ -131,7 +130,7 @@ async def handle_message(message: types.Message):
         result = Runner.run_streamed(
             agent,
             input=message.text,
-            max_turns=12,
+            max_turns=MAX_TURNS,
         )
 
         tools_used = {}
@@ -141,7 +140,6 @@ async def handle_message(message: types.Message):
             if isinstance(event, RunItemStreamEvent):
                 item_type = getattr(event.item, "type", None)
 
-                # --- Вызов инструмента ---
                 if item_type == "tool_call_item":
                     step += 1
                     tool_name = getattr(event.item.raw_item, "name", "инструмент")
@@ -157,23 +155,20 @@ async def handle_message(message: types.Message):
 
                     elapsed = int(time.time() - start_time)
                     text = (
-                        f"<b>Шаг {step}</b> · {elapsed} сек\n"
+                        f"<b>Шаг {step}/{MAX_TURNS}</b> · {elapsed} сек\n"
                         f"{human_tool_name(tool_name)} {args_display}".strip()
                     )
                     await message.answer(text, parse_mode="HTML")
 
-                # --- Результат от инструмента ---
                 elif item_type == "tool_call_output_item":
                     output = getattr(event.item, "output", "")
                     output_str = str(output)
-                    # Показываем первые 300 символов — этого достаточно, чтобы понять, что вернул MCP
                     preview = output_str[:300].replace("<", "&lt;").replace(">", "&gt;")
                     await message.answer(
                         f"📥 <b>Ответ инструмента</b>\n<code>{preview}</code>",
                         parse_mode="HTML",
                     )
 
-                # --- Сообщение модели (промежуточное) ---
                 elif item_type == "message_output_item":
                     content = getattr(event.item, "content", "")
                     content_str = str(content).strip()
@@ -184,12 +179,11 @@ async def handle_message(message: types.Message):
                             parse_mode="HTML",
                         )
 
-        # --- Поток завершён ---
         elapsed = int(time.time() - start_time)
         final_output = result.final_output
 
         await message.answer(
-            f"✅ <b>Готово за {elapsed} сек. Шагов: {step}</b>",
+            f"✅ <b>Готово за {elapsed} сек. Шагов: {step}/{MAX_TURNS}</b>",
             parse_mode="HTML",
         )
 
@@ -216,8 +210,8 @@ async def handle_message(message: types.Message):
         elapsed = int(time.time() - start_time)
         await message.answer(
             f"⏱ <b>Превышен лимит шагов ({elapsed} сек).</b>\n"
-            f"Модель зациклилась. Попробуйте назвать конкретное блюдо "
-            f"или сменить модель командой (изменив .env на сервере).",
+            f"Лимит: {MAX_TURNS}. Модель зациклилась. Попробуйте назвать "
+            f"конкретное блюдо или увеличьте MAX_TURNS в .env.",
             parse_mode="HTML",
         )
     except Exception as e:
