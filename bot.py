@@ -21,8 +21,6 @@ ALLOWED_USERS_FILE = Path(__file__).parent / "allowed_users.txt"
 
 
 def get_allowed_users() -> set[int]:
-    """Читает список разрешённых user_id из файла.
-    Формат: один ID на строку, комментарии через #."""
     ids: set[int] = set()
     try:
         with open(ALLOWED_USERS_FILE, "r", encoding="utf-8") as f:
@@ -40,12 +38,11 @@ def get_allowed_users() -> set[int]:
 
 
 def human_tool_name(tool_name: str) -> str:
-    """Переводит техническое имя инструмента в понятный текст."""
     mapping = {
         "vkusvill_recipes": "🔍 Ищу рецепт",
         "vkusvill_products_search": "🛒 Ищу товар",
-        "vkusvill_product_details": "📋 Уточняю детали товара",
-        "vkusvill_product_barcode": "📊 Ищу по штрихкоду",
+        "vkusvill_product_details": "📋 Уточняю детали",
+        "vkusvill_product_barcode": "📊 По штрихкоду",
         "vkusvill_product_analogs": "🔄 Ищу аналоги",
         "vkusvill_products_discount": "🏷 Ищу акции",
         "vkusvill_cart_link_create": "🛍 Собираю корзину",
@@ -55,13 +52,8 @@ def human_tool_name(tool_name: str) -> str:
 
 
 def describe_args(tool_name: str, args: dict) -> str:
-    """Кратко описывает аргументы вызова инструмента."""
-    if tool_name == "vkusvill_products_search":
+    if tool_name in ("vkusvill_products_search", "vkusvill_recipes"):
         q = args.get("q") or args.get("query")
-        if q:
-            return f"«{q}»"
-    if tool_name == "vkusvill_recipes":
-        q = args.get("q")
         if q:
             return f"«{q}»"
     if tool_name == "vkusvill_product_details" and "id" in args:
@@ -70,6 +62,13 @@ def describe_args(tool_name: str, args: dict) -> str:
         items = args.get("products", [])
         return f"({len(items)} товаров)"
     return ""
+
+
+def truncate(text: str, limit: int = 1500) -> str:
+    """Обрезает длинный текст до лимита Telegram."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…<обрезано>"
 
 
 bot = Bot(token=BOT_TOKEN)
@@ -123,25 +122,10 @@ async def handle_message(message: types.Message):
     short_model = MODEL_NAME.split("/")[-1].replace(":free", "")
     start_time = time.time()
 
-    status_msg = await message.answer(
+    await message.answer(
         f"🤔 Начинаю работу…\n<i>Модель: {short_model}</i>",
         parse_mode="HTML",
     )
-
-    # Троттлинг обновлений: не чаще раза в 2 секунды
-    last_edit_time = [0.0]
-
-    async def safe_edit(text: str):
-        """Обновляет статусное сообщение, но не чаще раза в 2 секунды."""
-        now = time.time()
-        if now - last_edit_time[0] < 2.0:
-            return
-        last_edit_time[0] = now
-        try:
-            await status_msg.edit_text(text, parse_mode="HTML")
-        except Exception:
-            # Telegram может отказать (например, сообщение не изменилось)
-            pass
 
     try:
         result = Runner.run_streamed(
@@ -151,15 +135,18 @@ async def handle_message(message: types.Message):
         )
 
         tools_used = {}
-        last_tool_display = ""
+        step = 0
 
         async for event in result.stream_events():
             if isinstance(event, RunItemStreamEvent):
-                if event.item.type == "tool_call_item":
+                item_type = getattr(event.item, "type", None)
+
+                # --- Вызов инструмента ---
+                if item_type == "tool_call_item":
+                    step += 1
                     tool_name = getattr(event.item.raw_item, "name", "инструмент")
                     tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
 
-                    # Кратко описываем аргументы
                     args_display = ""
                     try:
                         raw_args = getattr(event.item.raw_item, "arguments", "{}")
@@ -169,55 +156,76 @@ async def handle_message(message: types.Message):
                         pass
 
                     elapsed = int(time.time() - start_time)
-                    last_tool_display = f"{human_tool_name(tool_name)} {args_display}".strip()
+                    text = (
+                        f"<b>Шаг {step}</b> · {elapsed} сек\n"
+                        f"{human_tool_name(tool_name)} {args_display}".strip()
+                    )
+                    await message.answer(text, parse_mode="HTML")
 
-                    await safe_edit(
-                        f"🔧 {last_tool_display}\n"
-                        f"<i>Шаг {sum(tools_used.values())}, прошло {elapsed} сек</i>"
+                # --- Результат от инструмента ---
+                elif item_type == "tool_call_output_item":
+                    output = getattr(event.item, "output", "")
+                    output_str = str(output)
+                    # Показываем первые 300 символов — этого достаточно, чтобы понять, что вернул MCP
+                    preview = output_str[:300].replace("<", "&lt;").replace(">", "&gt;")
+                    await message.answer(
+                        f"📥 <b>Ответ инструмента</b>\n<code>{preview}</code>",
+                        parse_mode="HTML",
                     )
 
-        # Поток завершён, собираем итог
+                # --- Сообщение модели (промежуточное) ---
+                elif item_type == "message_output_item":
+                    content = getattr(event.item, "content", "")
+                    content_str = str(content).strip()
+                    if content_str:
+                        preview = content_str[:500].replace("<", "&lt;").replace(">", "&gt;")
+                        await message.answer(
+                            f"💬 <b>Модель говорит:</b>\n<pre>{preview}</pre>",
+                            parse_mode="HTML",
+                        )
+
+        # --- Поток завершён ---
         elapsed = int(time.time() - start_time)
         final_output = result.final_output
 
-        if final_output:
-            tools_summary = ""
-            if tools_used:
-                parts = [f"{n} ×{c}" if c > 1 else n for n, c in tools_used.items()]
-                tools_summary = (
-                    f"\n\n<i>⏱ {elapsed} сек · "
-                    f"шагов: {sum(tools_used.values())} · "
-                    f"{', '.join(parts)}</i>"
-                )
+        await message.answer(
+            f"✅ <b>Готово за {elapsed} сек. Шагов: {step}</b>",
+            parse_mode="HTML",
+        )
 
+        if final_output:
             try:
-                await status_msg.edit_text(
-                    final_output + tools_summary,
+                await message.answer(
+                    truncate(final_output),
                     parse_mode="HTML",
                     disable_web_page_preview=False,
                 )
             except Exception as send_error:
                 print(f"HTML parse failed, sending as plain text: {send_error}")
-                await status_msg.delete()
                 await message.answer(
-                    final_output,
+                    truncate(final_output),
                     disable_web_page_preview=False,
                 )
         else:
-            await status_msg.edit_text(
-                f"⚠️ Не получилось сформулировать ответ за {elapsed} сек. "
-                f"Попробуйте уточнить запрос."
+            await message.answer(
+                "⚠️ Финальный ответ пустой. Возможно, модель ушла в цикл "
+                "или превысила лимит шагов."
             )
 
     except MaxTurnsExceeded:
         elapsed = int(time.time() - start_time)
-        await status_msg.edit_text(
-            f"⏱ Превышен лимит шагов ({elapsed} сек). "
-            f"Попробуйте назвать конкретное блюдо — «борщ», «паста», «запеканка»."
+        await message.answer(
+            f"⏱ <b>Превышен лимит шагов ({elapsed} сек).</b>\n"
+            f"Модель зациклилась. Попробуйте назвать конкретное блюдо "
+            f"или сменить модель командой (изменив .env на сервере).",
+            parse_mode="HTML",
         )
     except Exception as e:
         elapsed = int(time.time() - start_time)
-        await status_msg.edit_text(f"❌ Ошибка через {elapsed} сек: {e}")
+        await message.answer(
+            f"❌ <b>Ошибка через {elapsed} сек:</b>\n<code>{e}</code>",
+            parse_mode="HTML",
+        )
         print(f"Ошибка: {e}")
 
 
