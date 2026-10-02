@@ -3,6 +3,7 @@ os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from dotenv import load_dotenv
@@ -64,15 +65,44 @@ def describe_args(tool_name: str, args: dict) -> str:
     return ""
 
 
+def _extract_text_payload(raw_output: str) -> str:
+    """
+    Достаёт полезную нагрузку из MCP-обёртки вида:
+    {'type': 'text', 'text': '{\n  "ok": true, ...}'}
+    Возвращает строку — то, что можно распарсить как JSON.
+    """
+    raw = raw_output.strip()
+
+    # Случай 1: питоновский dict со str-представлением
+    if raw.startswith("{'type'") or raw.startswith('{"type"'):
+        # Вытаскиваем содержимое поля 'text' регуляркой
+        m = re.search(
+            r"['\"]text['\"]\s*:\s*['\"]((?:[^'\"\\]|\\.)*)['\"]",
+            raw,
+            re.DOTALL,
+        )
+        if m:
+            extracted = m.group(1)
+            try:
+                # Раскодируем escape-последовательности (\n, \", \\ и т.д.)
+                extracted = bytes(extracted, "utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+            return extracted
+
+    # Случай 2: уже чистый JSON или что-то другое
+    return raw
+
+
 def format_tool_output(tool_name: str, raw_output: str) -> str:
-    """
-    Превращает сырой JSON от MCP в читаемую строку.
-    """
+    """Превращает сырой ответ MCP в читаемую строку."""
+    payload_str = _extract_text_payload(raw_output)
+
     try:
-        data = json.loads(raw_output)
+        data = json.loads(payload_str)
     except json.JSONDecodeError:
-        # Не JSON — просто обрезаем
-        return f"<code>{raw_output[:400]}</code>"
+        preview = payload_str[:400].replace("<", "&lt;").replace(">", "&gt;")
+        return f"<code>{preview}</code>"
 
     # --- Поиск товаров ---
     if tool_name == "vkusvill_products_search":
@@ -86,12 +116,9 @@ def format_tool_output(tool_name: str, raw_output: str) -> str:
             name = item.get("name", "?")
             price = item.get("price", {}).get("current", "?")
             unit = item.get("unit", "шт")
-            weight = item.get("weight", "")
-            # Обрезаем длинное название
             if len(name) > 50:
                 name = name[:50] + "…"
-            weight_str = f", {weight}" if weight else ""
-            lines.append(f"  • {name} — {price} ₽/{unit}{weight_str}")
+            lines.append(f"  • {name} — {price} ₽/{unit}")
         return "\n".join(lines)
 
     # --- Рецепты ---
@@ -101,14 +128,16 @@ def format_tool_output(tool_name: str, raw_output: str) -> str:
             return "❌ Рецепты не найдены"
         first = recipes[0]
         name = first.get("name", "?")
-        ingredients = first.get("ingredients", [])
         lines = [f"📖 {name}"]
+        ingredients = first.get("ingredients", []) or first.get("properties", [])
         if ingredients:
-            ings = ", ".join(
-                (ing.get("name", "?") if isinstance(ing, dict) else str(ing))
-                for ing in ingredients[:5]
-            )
-            lines.append(f"  Ингредиенты: {ings}…")
+            ings = []
+            for ing in ingredients[:6]:
+                if isinstance(ing, dict):
+                    ings.append(ing.get("name", "?"))
+                else:
+                    ings.append(str(ing))
+            lines.append(f"  Ингредиенты: {', '.join(ings)}…")
         return "\n".join(lines)
 
     # --- Создание корзины ---
@@ -124,7 +153,7 @@ def format_tool_output(tool_name: str, raw_output: str) -> str:
         return f"📋 {name} — {price} ₽"
 
     # --- Fallback ---
-    preview = raw_output[:300].replace("<", "&lt;").replace(">", "&gt;")
+    preview = payload_str[:300].replace("<", "&lt;").replace(">", "&gt;")
     return f"<code>{preview}</code>"
 
 
@@ -199,8 +228,6 @@ async def handle_message(message: types.Message):
 
         tools_used = {}
         step = 0
-        # Запоминаем имя последнего вызванного инструмента,
-        # чтобы правильно отформатировать его output
         last_tool_name = None
 
         async for event in result.stream_events():
