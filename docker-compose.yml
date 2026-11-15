@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: vkusvill-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./allowed_users.txt:/app/allowed_users.txt:ro
+    # Если нужен доступ к логам в файле:
+    # volumes:
+    #   - ./logs:/app/logs
