@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+.vscode/
+allowed_users.txt
+.git/
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+*.md
+test_*.py
+explore_*.py
+dump_*.py
+agent.py
